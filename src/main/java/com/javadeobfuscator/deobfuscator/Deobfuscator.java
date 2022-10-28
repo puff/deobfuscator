@@ -39,13 +39,15 @@ import com.javadeobfuscator.deobfuscator.rules.Rules;
 import com.javadeobfuscator.deobfuscator.transformers.Transformer;
 import com.javadeobfuscator.deobfuscator.utils.ClassTree;
 import com.javadeobfuscator.deobfuscator.utils.Utils;
-import me.coley.cafedude.ClassFile;
+import me.coley.cafedude.classfile.ClassFile;
 import me.coley.cafedude.InvalidClassException;
 import me.coley.cafedude.io.ClassFileReader;
 import me.coley.cafedude.io.ClassFileWriter;
+import me.coley.cafedude.transform.IllegalStrippingTransformer;
 import org.apache.commons.io.IOUtils;
 import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.ClassWriter;
+import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.commons.JSRInlinerAdapter;
 import org.objectweb.asm.tree.AbstractInsnNode;
 import org.objectweb.asm.tree.ClassNode;
@@ -63,6 +65,7 @@ public class Deobfuscator {
 
     private final Configuration configuration;
 
+    private final Set<String> missingRefs = new HashSet<>();
     private final Map<String, ClassNode> classpath = new HashMap<>();
     private final Map<String, ClassNode> libraries = new HashMap<>();
     private final Map<String, ClassNode> classes = new HashMap<>();
@@ -279,27 +282,21 @@ public class Deobfuscator {
             }
 
             try {
-
-                ClassReader reader;
-                ClassNode node;
-                try {
-                    reader = new ClassReader(data);
-                    node = new ClassNode();
-                    reader.accept(node, ClassReader.SKIP_FRAMES);
-                } catch (Throwable t) {
-                    // Check and see if Cafedood can patch out ASM crashing data
+                // Patching optional, disabling useful for ensuring that output problems related to patch process.
+                if (configuration.isPatchAsm()) {
                     ClassFileReader cfr = new ClassFileReader();
                     cfr.setDropForwardVersioned(true);
+                    cfr.setDropEofAttributes(true);
                     ClassFile cf = cfr.read(data);
+                    new IllegalStrippingTransformer(cf).transform();
                     ClassFileWriter cfw = new ClassFileWriter();
-                    byte[] fixedData = cfw.write(cf);
-                    // Should be compliant now unless a new crash is discovered.
-                    // Check for updates or open an issue on the CAFED00D project if this occurs
-                    reader = new ClassReader(fixedData);
-                    node = new ClassNode();
-                    reader.accept(node, ClassReader.SKIP_FRAMES);
+                    data = cfw.write(cf);
                 }
-
+                // Should be compliant now unless a new crash is discovered.
+                // Check for updates or open an issue on the CAFED00D project if this occurs
+                ClassReader reader = new ClassReader(data);
+                ClassNode node = new ClassNode();
+                reader.accept(node, ClassReader.SKIP_FRAMES);
                 readers.put(node, reader);
                 setConstantPool(node, new ConstantPool(reader));
 
@@ -325,11 +322,13 @@ public class Deobfuscator {
                 } else {
                     classpath.put(node.name, node);
                 }
-            } catch (IllegalArgumentException | ArrayIndexOutOfBoundsException | InvalidClassException x) {
-                if (this.configuration.isParamorphismV2()) {
+            } catch (IllegalArgumentException | IndexOutOfBoundsException | InvalidClassException x) {
+                if (configuration.isParamorphismV2()) {
                     invalidClasses.put(name, data);
+                } else  if (!configuration.isPatchAsm()) {
+                    logger.error("Could not parse {} (Try adding \"patchAsm: true\" to the config?)", name, x);
                 } else {
-                    logger.error("Could not parse {} (is it a class file?)", name, x);
+                    logger.error("Could not parse {} (Is it a class file?)", name, x);
                 }
             }
         }
@@ -388,13 +387,13 @@ public class Deobfuscator {
 	                if (message == null) {
 	                    continue;
 	                }
-	
+
 	                logger.info("");
 	                logger.info("{}: {}", rule.getClass().getSimpleName(), rule.getDescription());
 	                logger.info("\t{}", message);
 	                logger.info("Recommend transformers:");
 	                logger.info("(Choose one transformer. If there are multiple, it's recommended to try the transformer listed first)");
-	
+
 	                Collection<Class<? extends Transformer<?>>> recommended = rule.getRecommendTransformers();
 	                if (recommended == null) {
 	                    logger.info("\tNone");
@@ -416,14 +415,14 @@ public class Deobfuscator {
 
         logger.info("Computing callers");
         computeCallers();
-        
+
         if (configuration.isDeleteUselessClasses()) {
         	logger.warn("Warning: You have enabled the option \"delete useless classes\".");
         	logger.warn("This option will delete any classes whose superclasses or interfaces cannot be resolved for certain transformers.");
         	logger.warn("This feature is only to be used when your file contains trash classes that prevent transformers from working.");
         	logger.warn("All libraries must be added for this to work properly.");
         }
-        
+
         if (configuration.isSmartRedo()) {
         	logger.warn("You have enabled \"smart redo\". For some transformers, this may result in an infinite loop.");
         }
@@ -483,6 +482,11 @@ public class Deobfuscator {
 
     public ClassNode assureLoaded(String ref) {
         ClassNode clazz = classpath.get(ref);
+        // Attempt to fetch from runtime, cases like 'java/awt/bla' can be loaded this way
+        if (clazz == null) {
+            clazz = pullFromRuntime(ref);
+        }
+        // Still missing, cannot recover
         if (clazz == null) {
             throw new NoClassInPathException(ref);
         }
@@ -497,6 +501,23 @@ public class Deobfuscator {
             return null;
         }
         return clazz;
+    }
+
+    private ClassNode pullFromRuntime(String ref) {
+        try {
+            if (!missingRefs.contains(ref)) {
+                // Realistically we do not need the method bodies at all, can skip.
+                ClassNode node = new ClassNode(Opcodes.ASM9);
+                new ClassReader(ref).accept(node, ClassReader.SKIP_CODE);
+                classpath.put(ref, node);
+                return node;
+            }
+        } catch (IOException ex) {
+            // Ignored, plenty of cases where ref will not exist at runtime.
+            // Cache missing value so that we don't try again later.
+            missingRefs.add(ref);
+        }
+        return null;
     }
 
     public void loadHierachy() {
